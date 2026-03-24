@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence, PanInfo, useMotionValue, useSpring, useTransform } from 'framer-motion';
 import { X, Plus, Calendar, Users, User, Briefcase, ChevronDown } from 'lucide-react';
@@ -34,6 +34,8 @@ export const SelectRide: React.FC<SelectRideProps> = ({
   const location = useLocation();
   const { isRideActive, rideStatus } = useRideContext();
   const panelRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Read navigation state to determine service type
   const { serviceType = 'ride', extraOption } = location.state || {};
@@ -111,23 +113,33 @@ export const SelectRide: React.FC<SelectRideProps> = ({
     rideAreas: 'Gauteng'
   };
 
-  const handleDrag = (_event: any, info: PanInfo) => {
+  const handleDrag = useCallback((_event: any, info: PanInfo) => {
     const windowHeight = window.innerHeight;
     const deltaVh = (-info.delta.y / windowHeight) * 100;
     const newVh = rawPanelVh.get() + deltaVh;
     rawPanelVh.set(Math.max(PANEL_MIN_VH, Math.min(PANEL_MAX_VH, newVh)));
-  };
+  }, [rawPanelVh]);
 
-  const handleDragEnd = (_event: any, info: PanInfo) => {
+  const handleDragStart = useCallback(() => {
+    setIsDragging(true);
+  }, []);
+
+  const handleDragEnd = useCallback((_event: any, info: PanInfo) => {
+    setIsDragging(false);
     const velocity = -info.velocity.y;
 
     if (Math.abs(velocity) > 600) {
       rawPanelVh.set(velocity > 0 ? PANEL_MAX_VH : PANEL_MIN_VH);
     } else {
-      // Stay where released - spring settles smoothly
-      rawPanelVh.set(Math.max(PANEL_MIN_VH, Math.min(PANEL_MAX_VH, rawPanelVh.get())));
+      // Snap to nearest position
+      const currentVh = rawPanelVh.get();
+      if (currentVh > EXPAND_THRESHOLD_VH) {
+        rawPanelVh.set(PANEL_MAX_VH);
+      } else {
+        rawPanelVh.set(PANEL_MIN_VH);
+      }
     }
-  };
+  }, [rawPanelVh]);
 
   const getSortedCars = () => {
     let sorted = [...displayVehicles];
@@ -244,7 +256,6 @@ export const SelectRide: React.FC<SelectRideProps> = ({
         className="fixed bottom-0 left-0 right-0 bg-white rounded-t-3xl shadow-2xl z-20 flex flex-col will-change-transform"
         style={{
           height: panelHeightStyle,
-          touchAction: 'none'
         }}
         initial={{ y: 100, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
@@ -269,6 +280,7 @@ export const SelectRide: React.FC<SelectRideProps> = ({
           dragConstraints={{ top: 0, bottom: 0 }}
           dragElastic={0}
           dragMomentum={false}
+          onDragStart={handleDragStart}
           onDrag={handleDrag}
           onDragEnd={handleDragEnd}
           whileTap={{ scale: 1.02 }}
@@ -343,7 +355,14 @@ export const SelectRide: React.FC<SelectRideProps> = ({
           )}
         </AnimatePresence>
 
-        <div className="flex-1 overflow-y-auto px-4" style={{ WebkitOverflowScrolling: 'touch' }}>
+        <div 
+          ref={scrollRef}
+          className="flex-1 overflow-y-auto px-4 overscroll-contain"
+          style={{ 
+            WebkitOverflowScrolling: 'touch',
+            touchAction: isDragging ? 'none' : 'pan-y'
+          }}
+        >
           {isLoadingFleet ? (
             <div className="flex items-center justify-center py-8">
               <div className="text-center">

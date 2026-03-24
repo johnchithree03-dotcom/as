@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { motion, PanInfo, AnimatePresence } from 'framer-motion';
+import { motion, PanInfo, AnimatePresence, useMotionValue, useSpring, useTransform } from 'framer-motion';
 import { X, Plus, Calendar, User, Briefcase, ChevronDown } from 'lucide-react';
 import { useGlobalCart } from '../contexts/GlobalCartContext';
 import { DeliveryCard } from '../components/DeliveryCard';
@@ -43,9 +43,37 @@ export function FoodDelivery() {
 
   const [selectedFilter, setSelectedFilter] = useState<FilterTab>('standard');
   const [selectedModeId, setSelectedModeId] = useState<'motorbike' | 'car' | 'bicycle'>('car');
-  const [panelHeight, setPanelHeight] = useState(PANEL_MIN_HEIGHT);
   const [profileToggle, setProfileToggle] = useState<'personal' | 'business'>('personal');
   const panelRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [isScrolledToTop, setIsScrolledToTop] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Spring-driven panel height for smooth animations
+  const rawPanelVh = useMotionValue(PANEL_MIN_HEIGHT);
+  const springPanelVh = useSpring(rawPanelVh, {
+    stiffness: 300,
+    damping: 35,
+    mass: 0.8,
+  });
+  const panelHeightStyle = useTransform(springPanelVh, (v) => `${v}vh`);
+
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  // Track expansion state from spring value
+  useEffect(() => {
+    const unsubscribe = springPanelVh.on('change', (latest) => {
+      setIsExpanded(latest > SNAP_THRESHOLD);
+    });
+    return unsubscribe;
+  }, [springPanelVh]);
+
+  // Track scroll position to determine when to allow panel drag
+  const handleScroll = useCallback(() => {
+    if (scrollRef.current) {
+      setIsScrolledToTop(scrollRef.current.scrollTop <= 0);
+    }
+  }, []);
 
   // Use route data from localStorage
   const deliveryLocation = routeData?.deliveryLocation || '';
@@ -127,31 +155,42 @@ export function FoodDelivery() {
 
   const sortedModes = getSortedModes();
 
-  const handleDrag = (event: any, info: PanInfo) => {
+  // Handle drag on the drag handle only
+  const handleDrag = useCallback((_event: any, info: PanInfo) => {
     const windowHeight = window.innerHeight;
-    const dragDelta = -info.offset.y;
-    const dragPercent = (dragDelta / windowHeight) * 100;
-    const newHeight = Math.max(PANEL_MIN_HEIGHT, Math.min(PANEL_MAX_HEIGHT, PANEL_MIN_HEIGHT + dragPercent));
-    setPanelHeight(newHeight);
-  };
+    const deltaVh = (-info.delta.y / windowHeight) * 100;
+    const newVh = rawPanelVh.get() + deltaVh;
+    rawPanelVh.set(Math.max(PANEL_MIN_HEIGHT, Math.min(PANEL_MAX_HEIGHT, newVh)));
+  }, [rawPanelVh]);
 
-  const handleDragEnd = (event: any, info: PanInfo) => {
+  const handleDragStart = useCallback(() => {
+    setIsDragging(true);
+  }, []);
+
+  const handleDragEnd = useCallback((_event: any, info: PanInfo) => {
+    setIsDragging(false);
     const velocity = -info.velocity.y;
 
-    if (Math.abs(velocity) > 500) {
-      if (velocity > 0) {
-        setPanelHeight(PANEL_MAX_HEIGHT);
-      } else {
-        setPanelHeight(PANEL_MIN_HEIGHT);
-      }
+    if (Math.abs(velocity) > 600) {
+      rawPanelVh.set(velocity > 0 ? PANEL_MAX_HEIGHT : PANEL_MIN_HEIGHT);
     } else {
-      if (panelHeight > SNAP_THRESHOLD) {
-        setPanelHeight(PANEL_MAX_HEIGHT);
+      // Snap to nearest position
+      const currentVh = rawPanelVh.get();
+      if (currentVh > SNAP_THRESHOLD) {
+        rawPanelVh.set(PANEL_MAX_HEIGHT);
       } else {
-        setPanelHeight(PANEL_MIN_HEIGHT);
+        rawPanelVh.set(PANEL_MIN_HEIGHT);
       }
     }
-  };
+  }, [rawPanelVh]);
+
+  // Handle touch/scroll interaction on the scrollable content
+  const handleContentTouchStart = useCallback((e: React.TouchEvent) => {
+    // Only allow panel drag if scrolled to top and dragging down
+    if (!isScrolledToTop) {
+      e.stopPropagation();
+    }
+  }, [isScrolledToTop]);
 
   const handleClose = () => {
     // Use navigate(-1) to go back to previous page cleanly
@@ -307,23 +346,13 @@ export function FoodDelivery() {
 
       <motion.div
         ref={panelRef}
-        className="fixed bottom-0 left-0 right-0 bg-white rounded-t-3xl shadow-2xl z-20 flex flex-col"
-        drag="y"
-        dragConstraints={{ top: 0, bottom: 0 }}
-        dragElastic={0}
-        onDrag={handleDrag}
-        onDragEnd={handleDragEnd}
-        animate={{
-          height: `${panelHeight}vh`
-        }}
-        transition={{
-          type: 'spring',
-          damping: 30,
-          stiffness: 300
-        }}
+        className="fixed bottom-0 left-0 right-0 bg-white rounded-t-3xl shadow-2xl z-20 flex flex-col will-change-transform"
         style={{
-          touchAction: 'none'
+          height: panelHeightStyle,
         }}
+        initial={{ y: 100, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        transition={{ type: 'spring', damping: 30, stiffness: 260, mass: 0.6 }}
       >
         {PROMO_ACTIVE && (
           <motion.div
@@ -338,9 +367,19 @@ export function FoodDelivery() {
           </motion.div>
         )}
 
-        <div className="w-full pt-3 pb-2 flex justify-center cursor-grab active:cursor-grabbing flex-shrink-0">
+        <motion.div
+          className="w-full pt-3 pb-2 flex justify-center cursor-grab active:cursor-grabbing flex-shrink-0 touch-none"
+          drag="y"
+          dragConstraints={{ top: 0, bottom: 0 }}
+          dragElastic={0}
+          dragMomentum={false}
+          onDragStart={handleDragStart}
+          onDrag={handleDrag}
+          onDragEnd={handleDragEnd}
+          whileTap={{ scale: 1.02 }}
+        >
           <div className="w-12 h-1 bg-gray-300 rounded-full" />
-        </div>
+        </motion.div>
 
         <AnimatePresence>
           {isExpanded && (
@@ -409,7 +448,16 @@ export function FoodDelivery() {
           )}
         </AnimatePresence>
 
-        <div className="flex-1 overflow-y-auto px-4" style={{ WebkitOverflowScrolling: 'touch' }}>
+        <div 
+          ref={scrollRef}
+          className="flex-1 overflow-y-auto px-4 overscroll-contain"
+          style={{ 
+            WebkitOverflowScrolling: 'touch',
+            touchAction: isDragging ? 'none' : 'pan-y'
+          }}
+          onScroll={handleScroll}
+          onTouchStart={handleContentTouchStart}
+        >
           <div className="space-y-3 mb-6">
             {sortedModes.map((mode, index) => (
               <DeliveryCard

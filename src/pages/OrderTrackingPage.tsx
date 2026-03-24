@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
+import React, { useState, useEffect, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { Check, MapPin, Store, Package, Truck, User } from 'lucide-react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { db } from '../config/firebase';
@@ -28,31 +28,96 @@ interface OrderData {
   type?: string;
 }
 
-type OrderStatus = 'pending' | 'accepted' | 'preparing' | 'ready_for_pickup' | 'driver_assigned';
-
-const statusSteps: { key: OrderStatus | 'searching'; label: string; icon: React.ElementType }[] = [
-  { key: 'pending', label: 'Waiting for store to accept', icon: Store },
+// Status steps for the UI timeline
+// Note: "Preparing Items" is a UI-only stage that appears when status = "accepted"
+const statusSteps: { key: string; label: string; icon: React.ElementType }[] = [
   { key: 'accepted', label: 'Order Accepted', icon: Check },
   { key: 'preparing', label: 'Preparing Items', icon: Package },
   { key: 'ready_for_pickup', label: 'Ready for Pickup', icon: Package },
-  { key: 'searching', label: 'Assigning driver...', icon: Truck },
+  { key: 'searching', label: 'Assigning Driver', icon: Truck },
   { key: 'driver_assigned', label: 'Driver Assigned', icon: User },
 ];
 
-const getStatusIndex = (status: string, driverStatus?: string): number => {
-  if (status === 'driver_assigned' || (status === 'ready_for_pickup' && driverStatus === 'assigned')) {
-    return 5;
+// Rotating status messages for different stages
+const preparingMessages = [
+  "Preparing your order...",
+  "Packing everything carefully...",
+  "Almost ready...",
+];
+
+const searchingMessages = [
+  "Looking for nearby drivers...",
+  "Finding the fastest rider...",
+  "Connecting to a delivery partner...",
+];
+
+// Determine which steps are completed based on Firestore status and driverStatus
+const getCompletedSteps = (
+  status: string,
+  driverStatus: string,
+  preparingShown: boolean
+): { completed: boolean; current: boolean }[] => {
+  const steps = [
+    { completed: false, current: false }, // Order Accepted
+    { completed: false, current: false }, // Preparing Items
+    { completed: false, current: false }, // Ready for Pickup
+    { completed: false, current: false }, // Assigning Driver
+    { completed: false, current: false }, // Driver Assigned
+  ];
+
+  // Status: accepted -> Mark "Order Accepted" complete, "Preparing Items" becomes current (after delay)
+  if (status === 'accepted') {
+    steps[0] = { completed: true, current: false }; // Order Accepted
+    steps[1] = { completed: preparingShown, current: !preparingShown }; // Preparing Items
+    return steps;
   }
+
+  // Status: ready_for_pickup -> Mark first 3 steps complete
+  if (status === 'ready_for_pickup') {
+    steps[0] = { completed: true, current: false }; // Order Accepted
+    steps[1] = { completed: true, current: false }; // Preparing Items
+    steps[2] = { completed: true, current: false }; // Ready for Pickup
+
+    // Check if driver search has started
+    if (driverStatus === 'searching') {
+      steps[3] = { completed: false, current: true }; // Assigning Driver (current)
+    } else if (driverStatus === 'assigned') {
+      steps[3] = { completed: true, current: false }; // Assigning Driver (done)
+      steps[4] = { completed: true, current: false }; // Driver Assigned
+    }
+    return steps;
+  }
+
+  // Status: driver_assigned -> All steps complete
+  if (status === 'driver_assigned') {
+    steps[0] = { completed: true, current: false };
+    steps[1] = { completed: true, current: false };
+    steps[2] = { completed: true, current: false };
+    steps[3] = { completed: true, current: false };
+    steps[4] = { completed: true, current: false };
+    return steps;
+  }
+
+  // Also check driverStatus independently for driver assignment
+  if (driverStatus === 'assigned') {
+    steps[0] = { completed: true, current: false };
+    steps[1] = { completed: true, current: false };
+    steps[2] = { completed: true, current: false };
+    steps[3] = { completed: true, current: false };
+    steps[4] = { completed: true, current: false };
+    return steps;
+  }
+
   if (driverStatus === 'searching') {
-    return 4;
+    steps[0] = { completed: true, current: false };
+    steps[1] = { completed: true, current: false };
+    steps[2] = { completed: true, current: false };
+    steps[3] = { completed: false, current: true }; // Assigning Driver (current)
+    return steps;
   }
-  const statusMap: Record<string, number> = {
-    pending: 0,
-    accepted: 1,
-    preparing: 2,
-    ready_for_pickup: 3,
-  };
-  return statusMap[status] ?? 0;
+
+  // Default: waiting for order to be accepted
+  return steps;
 };
 
 export const OrderTrackingPage: React.FC = () => {
@@ -61,7 +126,30 @@ export const OrderTrackingPage: React.FC = () => {
   const { orderId, orderData: initialOrderData } = location.state || {};
 
   const [orderData, setOrderData] = useState<OrderData>(initialOrderData || {});
-  const [currentStatusIndex, setCurrentStatusIndex] = useState(0);
+  const [preparingShown, setPreparingShown] = useState(false);
+  const [rotatingMessage, setRotatingMessage] = useState('');
+  const [messageIndex, setMessageIndex] = useState(0);
+  
+  // Refs for timeouts
+  const preparingDelayRef = useRef<NodeJS.Timeout | null>(null);
+  const transitionDelayRef = useRef<NodeJS.Timeout | null>(null);
+  const messageRotationRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Calculate step states based on current Firestore data
+  const stepStates = getCompletedSteps(
+    orderData.status || '',
+    orderData.driverStatus || '',
+    preparingShown
+  );
+
+  // Determine current stage for rotating messages
+  const currentStage = orderData.driverStatus === 'searching' 
+    ? 'searching' 
+    : (orderData.status === 'accepted' && !preparingShown) 
+      ? 'preparing' 
+      : orderData.status === 'accepted' 
+        ? 'preparing' 
+        : null;
 
   // Listen to Firestore order document in real-time
   useEffect(() => {
@@ -72,27 +160,96 @@ export const OrderTrackingPage: React.FC = () => {
       if (snapshot.exists()) {
         const data = snapshot.data() as OrderData;
         setOrderData({ ...data, id: orderId });
-
-        const newStatusIndex = getStatusIndex(data.status || 'pending', data.driverStatus);
-        setCurrentStatusIndex(newStatusIndex);
-
-        // Auto transition to LiveTrackingPage when driver is assigned
-        if (data.status === 'driver_assigned' || data.driverId) {
-          setTimeout(() => {
-            navigate('/live-tracking', {
-              state: {
-                orderId,
-                orderData: { ...data, id: orderId },
-              },
-              replace: true,
-            });
-          }, 2500);
-        }
       }
     });
 
     return () => unsubscribe();
-  }, [orderId, navigate]);
+  }, [orderId]);
+
+  // Handle "Preparing Items" delay when status becomes "accepted"
+  useEffect(() => {
+    if (orderData.status === 'accepted' && !preparingShown) {
+      // Clear any existing timeout
+      if (preparingDelayRef.current) {
+        clearTimeout(preparingDelayRef.current);
+      }
+      // After 5 seconds, mark "Preparing Items" as active
+      preparingDelayRef.current = setTimeout(() => {
+        setPreparingShown(true);
+      }, 5000);
+    }
+
+    return () => {
+      if (preparingDelayRef.current) {
+        clearTimeout(preparingDelayRef.current);
+      }
+    };
+  }, [orderData.status, preparingShown]);
+
+  // Handle transition to LiveTrackingPage when driverStatus becomes "searching"
+  useEffect(() => {
+    if (orderData.driverStatus === 'searching') {
+      // Clear any existing timeout
+      if (transitionDelayRef.current) {
+        clearTimeout(transitionDelayRef.current);
+      }
+      // After 3 seconds, transition to live tracking
+      transitionDelayRef.current = setTimeout(() => {
+        navigate('/live-tracking', {
+          state: {
+            orderId,
+            orderData: { ...orderData, id: orderId },
+          },
+          replace: true,
+        });
+      }, 3000);
+    }
+
+    // Also transition immediately if driver is assigned
+    if (orderData.status === 'driver_assigned' || orderData.driverStatus === 'assigned' || orderData.driverId) {
+      if (transitionDelayRef.current) {
+        clearTimeout(transitionDelayRef.current);
+      }
+      transitionDelayRef.current = setTimeout(() => {
+        navigate('/live-tracking', {
+          state: {
+            orderId,
+            orderData: { ...orderData, id: orderId },
+          },
+          replace: true,
+        });
+      }, 1500);
+    }
+
+    return () => {
+      if (transitionDelayRef.current) {
+        clearTimeout(transitionDelayRef.current);
+      }
+    };
+  }, [orderData.driverStatus, orderData.status, orderData.driverId, orderId, navigate, orderData]);
+
+  // Rotate status messages every 3-4 seconds
+  useEffect(() => {
+    const messages = currentStage === 'searching' ? searchingMessages : preparingMessages;
+    
+    if (currentStage) {
+      setRotatingMessage(messages[0]);
+      
+      messageRotationRef.current = setInterval(() => {
+        setMessageIndex((prev) => {
+          const nextIndex = (prev + 1) % messages.length;
+          setRotatingMessage(messages[nextIndex]);
+          return nextIndex;
+        });
+      }, 3500);
+    }
+
+    return () => {
+      if (messageRotationRef.current) {
+        clearInterval(messageRotationRef.current);
+      }
+    };
+  }, [currentStage]);
 
   const containerVariants = {
     hidden: { opacity: 0 },
@@ -139,26 +296,37 @@ export const OrderTrackingPage: React.FC = () => {
         >
           <motion.div variants={containerVariants} initial="hidden" animate="visible" className="space-y-0">
             {statusSteps.map((step, index) => {
-              const isCompleted = index < currentStatusIndex;
-              const isCurrent = index === currentStatusIndex;
+              const { completed: isCompleted, current: isCurrent } = stepStates[index];
               const Icon = step.icon;
 
               return (
                 <motion.div key={step.key} variants={itemVariants} className="relative">
                   <div className="flex items-start">
-                    {/* Timeline Line */}
+                    {/* Timeline Line with animated fill */}
                     {index < statusSteps.length - 1 && (
-                      <div
-                        className={`absolute left-[15px] top-[28px] w-0.5 h-8 transition-colors duration-500 ${
-                          isCompleted ? 'bg-green-500' : 'bg-gray-200'
-                        }`}
-                      />
+                      <div className="absolute left-[15px] top-[28px] w-0.5 h-8 bg-gray-200">
+                        <motion.div
+                          initial={{ height: 0 }}
+                          animate={{ height: isCompleted ? '100%' : '0%' }}
+                          transition={{ duration: 0.5, ease: 'easeOut' }}
+                          className="bg-green-500 w-full"
+                        />
+                      </div>
                     )}
 
-                    {/* Icon Circle */}
+                    {/* Icon Circle with animations */}
                     <motion.div
-                      animate={isCurrent ? { scale: [1, 1.1, 1] } : {}}
-                      transition={isCurrent ? { repeat: Infinity, duration: 1.5 } : {}}
+                      initial={{ scale: 0.8, opacity: 0.5 }}
+                      animate={
+                        isCurrent 
+                          ? { 
+                              scale: [1, 1.15, 1], 
+                              opacity: 1,
+                              boxShadow: ['0 0 0 0 rgba(34, 197, 94, 0.4)', '0 0 0 8px rgba(34, 197, 94, 0)', '0 0 0 0 rgba(34, 197, 94, 0.4)']
+                            } 
+                          : { scale: 1, opacity: 1 }
+                      }
+                      transition={isCurrent ? { repeat: Infinity, duration: 2, ease: 'easeInOut' } : { duration: 0.3 }}
                       className={`relative z-10 w-8 h-8 rounded-full flex items-center justify-center transition-all duration-500 ${
                         isCompleted
                           ? 'bg-green-500 text-white'
@@ -167,34 +335,70 @@ export const OrderTrackingPage: React.FC = () => {
                           : 'bg-gray-200 text-gray-400'
                       }`}
                     >
-                      {isCompleted ? <Check size={16} /> : <Icon size={16} />}
+                      {isCompleted ? (
+                        <motion.div
+                          initial={{ scale: 0 }}
+                          animate={{ scale: 1 }}
+                          transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+                        >
+                          <Check size={16} />
+                        </motion.div>
+                      ) : (
+                        <Icon size={16} />
+                      )}
                     </motion.div>
 
-                    {/* Label */}
+                    {/* Label with bold animation */}
                     <div className="ml-3 pb-6">
-                      <p
-                        className={`text-sm font-medium transition-colors duration-300 ${
-                          isCompleted || isCurrent ? 'text-gray-900' : 'text-gray-400'
-                        } ${isCurrent ? 'font-bold' : ''}`}
+                      <motion.p
+                        animate={{ 
+                          fontWeight: isCurrent ? 700 : isCompleted ? 500 : 400,
+                          color: isCompleted || isCurrent ? '#111827' : '#9ca3af'
+                        }}
+                        transition={{ duration: 0.3 }}
+                        className="text-sm"
                       >
                         {step.label}
-                      </p>
-                      {isCurrent && step.key === 'searching' && (
+                      </motion.p>
+                      
+                      {/* Pulsing indicator and rotating message for current step */}
+                      {isCurrent && (
                         <motion.div
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          className="flex items-center mt-1"
+                          initial={{ opacity: 0, y: -5 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="flex items-center mt-1 space-x-2"
                         >
-                          <div className="flex space-x-1">
-                            {[0, 1, 2].map((i) => (
-                              <motion.div
-                                key={i}
-                                animate={{ scale: [1, 1.3, 1] }}
-                                transition={{ repeat: Infinity, duration: 0.6, delay: i * 0.2 }}
-                                className="w-1.5 h-1.5 bg-green-500 rounded-full"
-                              />
-                            ))}
-                          </div>
+                          {/* Pulsing dot */}
+                          <motion.div
+                            animate={{ 
+                              scale: [1, 1.3, 1],
+                              opacity: [0.7, 1, 0.7]
+                            }}
+                            transition={{ repeat: Infinity, duration: 1.5, ease: 'easeInOut' }}
+                            className="w-2 h-2 bg-green-500 rounded-full"
+                          />
+                          
+                          {/* Loading dots for searching */}
+                          {step.key === 'searching' && (
+                            <div className="flex space-x-1">
+                              {[0, 1, 2].map((i) => (
+                                <motion.div
+                                  key={i}
+                                  animate={{ 
+                                    y: [0, -4, 0],
+                                    opacity: [0.5, 1, 0.5]
+                                  }}
+                                  transition={{ 
+                                    repeat: Infinity, 
+                                    duration: 0.8, 
+                                    delay: i * 0.15,
+                                    ease: 'easeInOut'
+                                  }}
+                                  className="w-1.5 h-1.5 bg-green-500 rounded-full"
+                                />
+                              ))}
+                            </div>
+                          )}
                         </motion.div>
                       )}
                     </div>
@@ -203,6 +407,22 @@ export const OrderTrackingPage: React.FC = () => {
               );
             })}
           </motion.div>
+
+          {/* Rotating status message */}
+          <AnimatePresence mode="wait">
+            {rotatingMessage && (
+              <motion.div
+                key={rotatingMessage}
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                transition={{ duration: 0.3 }}
+                className="mt-4 text-center"
+              >
+                <p className="text-sm text-gray-600 italic">{rotatingMessage}</p>
+              </motion.div>
+            )}
+          </AnimatePresence>
         </motion.div>
       </div>
 
